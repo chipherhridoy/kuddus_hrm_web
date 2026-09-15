@@ -1,10 +1,11 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, useCallback } from "react";
 import Link from "next/link";
 import { useAuth } from "@/lib/auth-context";
 import { fetchApi } from "@/lib/api";
 import { AttendanceStats, AttendanceRecord, LeaveRequest } from "@/lib/types";
+import { useAttendanceSignalR, LiveAttendanceEvent } from "@/lib/signalr";
 import StatCard from "@/components/StatCard";
 
 export default function Dashboard() {
@@ -24,8 +25,96 @@ export default function Dashboard() {
   const [punchNotes, setPunchNotes] = useState("");
   const [bannerMessage, setBannerMessage] = useState<string | null>(null);
   const [myTodayRecord, setMyTodayRecord] = useState<AttendanceRecord | null>(null);
+  const [liveNotice, setLiveNotice] = useState<{ text: string; key: number } | null>(null);
 
   const [refreshKey, setRefreshKey] = useState(0);
+
+  const handleLiveAttendance = useCallback(
+    (event: LiveAttendanceEvent) => {
+      const timeStr = new Date(event.timestamp).toLocaleTimeString([], {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      const noticeText =
+        event.type === "CHECK_IN"
+          ? `⚡ Real-Time Punch: ${event.userName} checked in (${event.status}) at ${timeStr}`
+          : `⚡ Real-Time Punch: ${event.userName} checked out at ${timeStr}`;
+
+      setLiveNotice({ text: noticeText, key: Date.now() });
+
+      const recordDate = new Date(event.timestamp).toISOString().split("T")[0];
+
+      if (event.type === "CHECK_IN") {
+        setRecords((prev) => {
+          const exists = prev.some((r) => r.userId === event.userId && r.date === recordDate);
+          if (exists) {
+            return prev.map((r) =>
+              r.userId === event.userId && r.date === recordDate
+                ? { ...r, checkInTime: event.timestamp, status: event.status, notes: event.notes || r.notes }
+                : r
+            );
+          }
+          const newRec: AttendanceRecord = {
+            id: Date.now(),
+            userId: event.userId,
+            userName: event.userName,
+            userRole: event.userRole || "Staff",
+            userDepartment: "General",
+            date: recordDate,
+            checkInTime: event.timestamp,
+            checkOutTime: null,
+            status: event.status,
+            notes: event.notes || "Live scan",
+            latitude: event.latitude,
+            longitude: event.longitude,
+          };
+          return [newRec, ...prev];
+        });
+
+        if (user && user.id === event.userId) {
+          setMyTodayRecord((prev) => ({
+            id: prev?.id || Date.now(),
+            userId: event.userId,
+            userName: event.userName,
+            userRole: event.userRole || "Staff",
+            userDepartment: prev?.userDepartment || "General",
+            date: recordDate,
+            checkInTime: event.timestamp,
+            checkOutTime: null,
+            status: event.status,
+            notes: event.notes || "Live scan",
+          }));
+        }
+      } else if (event.type === "CHECK_OUT") {
+        setRecords((prev) =>
+          prev.map((r) =>
+            r.userId === event.userId && r.date === recordDate
+              ? { ...r, checkOutTime: event.timestamp }
+              : r
+          )
+        );
+
+        if (user && user.id === event.userId) {
+          setMyTodayRecord((prev) => (prev ? { ...prev, checkOutTime: event.timestamp } : prev));
+        }
+      }
+
+      // Background refresh of stats
+      fetchApi("/attendance/stats")
+        .then((r) => (r.ok ? r.json() : null))
+        .then((s) => s && setStats(s))
+        .catch(() => {});
+    },
+    [user]
+  );
+
+  const { isConnected } = useAttendanceSignalR(handleLiveAttendance);
+
+  useEffect(() => {
+    if (!liveNotice) return;
+    const t = setTimeout(() => setLiveNotice(null), 6000);
+    return () => clearTimeout(t);
+  }, [liveNotice]);
 
   useEffect(() => {
     let isMounted = true;
@@ -157,27 +246,71 @@ export default function Dashboard() {
           </p>
         </div>
 
-        <button
-          onClick={handleRefresh}
-          disabled={loading}
-          className="self-start sm:self-auto px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 rounded-xl border border-slate-200 shadow-xs transition-colors flex items-center gap-2"
-        >
-          <svg
-            className={`w-3.5 h-3.5 text-slate-500 ${loading ? "animate-spin" : ""}`}
-            fill="none"
-            stroke="currentColor"
-            viewBox="0 0 24 24"
+        <div className="flex items-center gap-3">
+          <div
+            className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-full text-xs font-semibold border transition-all ${
+              isConnected
+                ? "bg-emerald-50 text-emerald-700 border-emerald-200 shadow-xs"
+                : "bg-amber-50 text-amber-700 border-amber-200"
+            }`}
+            title={
+              isConnected
+                ? "Live WebSocket connected. Automatic real-time updates enabled."
+                : "Connecting to real-time attendance hub..."
+            }
           >
-            <path
-              strokeLinecap="round"
-              strokeLinejoin="round"
-              strokeWidth="2"
-              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+            <span
+              className={`w-2 h-2 rounded-full ${
+                isConnected ? "bg-emerald-500 animate-pulse" : "bg-amber-400"
+              }`}
             />
-          </svg>
-          <span>Refresh Data</span>
-        </button>
+            <span>{isConnected ? "Live Sync Active" : "Connecting..."}</span>
+          </div>
+
+          <button
+            onClick={handleRefresh}
+            disabled={loading}
+            className="self-start sm:self-auto px-4 py-2 text-xs font-semibold bg-white hover:bg-slate-50 text-slate-700 rounded-xl border border-slate-200 shadow-xs transition-colors flex items-center gap-2"
+          >
+            <svg
+              className={`w-3.5 h-3.5 text-slate-500 ${loading ? "animate-spin" : ""}`}
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15"
+              />
+            </svg>
+            <span>Refresh Data</span>
+          </button>
+        </div>
       </div>
+
+      {liveNotice && (
+        <div
+          key={liveNotice.key}
+          className="p-4 rounded-xl bg-gradient-to-r from-emerald-900 to-slate-900 text-white text-xs font-medium flex items-center justify-between shadow-lg border border-emerald-700/50 animate-in slide-in-from-top-2 duration-300"
+        >
+          <div className="flex items-center gap-2.5">
+            <span className="relative flex h-2.5 w-2.5">
+              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+              <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+            </span>
+            <span className="font-bold text-emerald-300">Live Update:</span>
+            <span>{liveNotice.text}</span>
+          </div>
+          <button
+            onClick={() => setLiveNotice(null)}
+            className="text-xs text-slate-300 hover:text-white px-2 py-1 rounded transition-colors font-bold"
+          >
+            ✕
+          </button>
+        </div>
+      )}
 
       {bannerMessage && (
         <div className="p-4 rounded-xl bg-slate-900 text-white text-xs font-medium flex items-center justify-between shadow-sm">
@@ -459,8 +592,8 @@ export default function Dashboard() {
                     </td>
                     <td className="px-6 py-3.5 text-slate-600">{record.userDepartment}</td>
                     <td className="px-6 py-3.5 font-mono text-slate-500">{record.date}</td>
-                    <td className="px-6 py-3.5 font-mono text-slate-900 font-semibold">{record.checkInTime}</td>
-                    <td className="px-6 py-3.5 font-mono text-slate-500">{record.checkOutTime || "--:--"}</td>
+                    <td className="px-6 py-3.5 font-mono text-slate-900 font-semibold">{formatTime(record.checkInTime)}</td>
+                    <td className="px-6 py-3.5 font-mono text-slate-500">{formatTime(record.checkOutTime)}</td>
                     <td className="px-6 py-3.5">
                       <span
                         className={`inline-flex items-center px-2.5 py-0.5 rounded-full text-[11px] font-semibold border ${
@@ -486,4 +619,16 @@ export default function Dashboard() {
       </div>
     </div>
   );
+}
+
+function formatTime(val?: string | null) {
+  if (!val) return "--:--";
+  if (val.includes("T")) {
+    try {
+      return new Date(val).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+    } catch {
+      return val;
+    }
+  }
+  return val;
 }
